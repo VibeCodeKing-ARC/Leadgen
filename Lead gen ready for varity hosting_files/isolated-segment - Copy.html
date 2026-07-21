@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<!-- saved from url=(0054)https://a.claude.ai/isolated-segment.html?v=23ece27bf4 -->
+<html lang="en" crxlauncher=""><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    
+    <!-- Segment snippet from https://segment.com/docs/connections/sources/catalog/libraries/website/javascript/quickstart/ -->
+    <!-- Modified to allow custom CDN hostname and removed unused methods -->
+    <script type="text/javascript" async="" src="./js"></script><script type="text/javascript" async="" src="./js(1)"></script><script async="" src="./js(2)"></script><script type="text/javascript" async="" data-global-segment-analytics-key="analytics" src="./analytics.min.js.download"></script><script>
+      !(function () {
+        var i = "analytics",
+          analytics = (window[i] = window[i] || []);
+        if (!analytics.initialize)
+          if (analytics.invoked)
+            window.console &&
+              console.error &&
+              console.error("Segment snippet included twice.");
+          else {
+            analytics.invoked = !0;
+            analytics.methods = ["identify", "track", "ready"];
+            analytics.factory = function (e) {
+              return function () {
+                if (window[i].initialized)
+                  return window[i][e].apply(window[i], arguments);
+                var n = Array.prototype.slice.call(arguments);
+                if (["track", "identify"].indexOf(e) > -1) {
+                  var c = document.querySelector("link[rel='canonical']");
+                  n.push({
+                    __t: "bpc",
+                    c: (c && c.getAttribute("href")) || void 0,
+                    p: location.pathname,
+                    u: location.href,
+                    s: location.search,
+                    t: document.title,
+                    r: document.referrer,
+                  });
+                }
+                n.unshift(e);
+                analytics.push(n);
+                return analytics;
+              };
+            };
+            for (var n = 0; n < analytics.methods.length; n++) {
+              var key = analytics.methods[n];
+              analytics[key] = analytics.factory(key);
+            }
+            analytics.SNIPPET_VERSION = "5.2.1";
+          }
+      })();
+    </script>
+    <script>
+      (function () {
+        // Debug logging function
+        function logDebug(message, ...args) {
+          console.debug("[IsolatedSegment]", message, ...args);
+        }
+
+        // Keep sending ready message until we get init response
+        let readyInterval = null;
+
+        // --- pixel telemetry -------------------------------------------
+        // Observability for vendor pixel network requests. Two
+        // independent counters, no correlation:
+        //  - pixel_attempt:  posted at each vendor call site in track()
+        //  - pixel_observed: posted per classified beacon seen by a
+        //                    PerformanceObserver on resource timings
+        // A blocked/failed vendor (ad-blocker, CSP, DNS, SDK didn't
+        // load) shows up as attempt-without-observed in aggregate. The
+        // resource URL is used only for vendor classification here and
+        // is never sent to the parent.
+        //
+        // Cross-origin caveat: pixel endpoints (facebook.com/tr,
+        // doubleclick.net, googleadservices.com) do not send
+        // Timing-Allow-Origin, so responseStatus is zeroed for most
+        // entries; http_status is only populated when the browser
+        // actually exposes it.
+        var pixelFirePixelIds = {}; // vendor → configured pixel/tag ID
+
+        // Patterns match only the conversion beacons, not loader /
+        // aux / config requests (e.g. gtag/destination,
+        // conversion_async.js). gtag typically fans one conversion
+        // out to several of these endpoints; each is reported as its
+        // own pixel_observed — attempt and observed counts are not
+        // expected to be 1:1 per event, only comparable in aggregate.
+        var PIXEL_FIRE_PATTERNS = [
+          { match: "facebook.com/tr", vendor: "facebook" },
+          { match: "googleadservices.com/pagead/conversion/", vendor: "google_ads" },
+          { match: "google.com/pagead/", vendor: "google_ads" },
+          { match: "googleads.g.doubleclick.net/pagead/", vendor: "google_ads" },
+          { match: "fls.doubleclick.net/", vendor: "floodlight" },
+          { match: "ad.doubleclick.net/activity", vendor: "floodlight" },
+          { match: "ad.doubleclick.net/ddm/activity", vendor: "floodlight" },
+        ];
+
+        function classifyPixelResource(url) {
+          for (var i = 0; i < PIXEL_FIRE_PATTERNS.length; i++) {
+            if (url.indexOf(PIXEL_FIRE_PATTERNS[i].match) !== -1) {
+              return PIXEL_FIRE_PATTERNS[i];
+            }
+          }
+          return null;
+        }
+
+        function sendPixelTelemetry(payload) {
+          if (window.isolatedSegment && window.isolatedSegment.sendMessage) {
+            window.isolatedSegment.sendMessage(payload);
+          }
+        }
+
+        function pixelAttempt(pixel) {
+          if (!pixel) return;
+          sendPixelTelemetry({ type: "pixel_attempt", pixel: pixel });
+        }
+
+        function pixelObserved(entry, cls) {
+          var pixel = pixelFirePixelIds[cls.vendor];
+          if (!pixel) return;
+          var payload = {
+            type: "pixel_observed",
+            pixel: pixel,
+            duration_ms: Math.round(entry.duration || 0),
+          };
+          var status = entry.responseStatus;
+          if (typeof status === "number" && status > 0) {
+            payload.http_status = status;
+          }
+          sendPixelTelemetry(payload);
+        }
+
+        function startPixelFireObserver() {
+          if (typeof PerformanceObserver === "undefined") return;
+          try {
+            var po = new PerformanceObserver(function (list) {
+              var entries = list.getEntries();
+              for (var i = 0; i < entries.length; i++) {
+                var cls = classifyPixelResource(entries[i].name);
+                if (cls) try { pixelObserved(entries[i], cls); } catch {}
+              }
+            });
+            po.observe({ type: "resource", buffered: true });
+          } catch (e) {
+            logDebug("pixel telemetry PerformanceObserver unavailable", {
+              error: String(e),
+            });
+          }
+        }
+        // --- end pixel telemetry ---------------------------------------
+
+        /* The values of this mapping must match the values in the Facebook CAPI destinations in Segment
+           See go/segment -> Destinations -> Facebook Conversions API -> Mappings
+           We have to do this mapping because the Facebook Pixel integration from Segment does not support
+           event renaming on the client side
+        */
+        const FB_EVENT_MAPPING = {
+          "onboarding.started": "Started Onboarding",
+          "extended_onboarding.started": "Started Onboarding",
+          "extended_onboarding.completed": "CompleteRegistration",
+          "chat.conversation.first_conversation_created": "NewConversation",
+          payment_state_success: "Purchase",
+        };
+
+        // Floodlight activity tag resolver: returns the CM360 send_to string
+        // for an event, or null if the event has no Floodlight conversion.
+        // Format: DC-ADVERTISER_ID/activity_group/activity_tag+counting_method
+        function resolveFloodlightSendTo(event, properties) {
+          var props = properties || {};
+          switch (event) {
+            case "extended_onboarding.completed":
+              // CM360: Onboarding Completed [production]
+              return "DC-15684265/check0/onboa000+unique";
+            case "payment_state_success":
+              if (props.product_capability === "claude_pro") {
+                // CM360: Purchased Pro [production]
+                return "DC-15684265/check0/purch00+unique";
+              }
+              if (props.product_capability === "claude_max") {
+                if (props.rate_limit_tier === "default_claude_max_20x") {
+                  // CM360: Purchased Max 20x [production]
+                  return "DC-15684265/check0/purch001+unique";
+                }
+                // CM360: Purchased Max 5x [production]
+                return "DC-15684265/check0/purch000+unique";
+              }
+              return null;
+            default:
+              return null;
+          }
+        }
+
+        // Google Ads conversion resolver: returns the conversion params for
+        // an event, or null. Format: AW-CONVERSION_ID/CONVERSION_LABEL
+        function resolveGoogleAdsConversion(event, properties) {
+          switch (event) {
+            case "extended_onboarding.completed":
+              // Google Ads: Sign-up
+              return {
+                send_to: "AW-16632748715/vj71CLSLlPwbEKu1jvs9",
+                value: 1.0,
+                currency: "USD",
+              };
+            case "payment_state_success":
+              // Google Ads: Purchase. transaction_id is omitted when no real
+              // value exists — Google Ads dedupes on it, so passing "" would
+              // collapse all such conversions into one.
+              var purchase = {
+                send_to: "AW-16632748715/H4ugCKmKh_wbEKu1jvs9",
+                value: 1.0,
+                currency: "USD",
+              };
+              if (properties && properties.invoice_created_ts) {
+                purchase.transaction_id = String(
+                  properties.invoice_created_ts,
+                );
+              }
+              return purchase;
+            default:
+              return null;
+          }
+        }
+
+        // Google Ads MCC-account conversion resolver. Parallel to
+        // resolveGoogleAdsConversion above — dual-fires to the MCC
+        // (manager) account while the legacy direct account is still
+        // live, so either side can be removed independently once the
+        // migration settles. Purchase-only for now.
+        function resolveGoogleAdsMccConversion(event, properties) {
+          switch (event) {
+            case "payment_state_success":
+              // Google Ads (MCC): Purchase. transaction_id mirrors the
+              // legacy account's dedup key (invoice_created_ts) so both
+              // accounts dedupe identically; may switch to external_id
+              // once that value is available client-side. Omitted when
+              // absent — Google Ads dedupes on it, so an empty string
+              // would collapse all such conversions into one.
+              var purchase = {
+                send_to: "AW-11477462985/5dbtCKe7qbccEMnf8OAq",
+                value: 1.0,
+                currency: "USD",
+              };
+              if (properties && properties.invoice_created_ts) {
+                purchase.transaction_id = String(
+                  properties.invoice_created_ts,
+                );
+              }
+              return purchase;
+            default:
+              return null;
+          }
+        }
+
+        // Initialize gtag.js directly (no GTM container)
+        function initGtag(measurementId, floodlightId, mccMeasurementId) {
+          if (!measurementId && !floodlightId && !mccMeasurementId) {
+            logDebug("No measurement or Floodlight ID provided, skipping gtag");
+            return;
+          }
+
+          window.dataLayer = window.dataLayer || [];
+          window.gtag = function () {
+            window.dataLayer.push(arguments);
+          };
+
+          // Set default consent to granted since the parent only renders
+          // this iframe when marketing consent is already granted
+          window.gtag("consent", "default", {
+            ad_personalization: "granted",
+            ad_user_data: "granted",
+            ad_storage: "granted",
+            analytics_storage: "granted",
+            functionality_storage: "granted",
+            personalization_storage: "granted",
+            security_storage: "granted",
+          });
+          window.gtag("js", new Date());
+
+          // Load the gtag.js script using whichever ID is available
+          var primaryId = measurementId || floodlightId || mccMeasurementId;
+          var scriptTag = document.createElement("script");
+          scriptTag.async = true;
+          scriptTag.src =
+            "https://www.googletagmanager.com/gtag/js?id=" + primaryId;
+          var firstTag = document.getElementsByTagName("script")[0];
+          firstTag.parentNode.insertBefore(scriptTag, firstTag);
+
+          // Configure measurement ID (Google Ads / GA4)
+          if (measurementId) {
+            window.gtag("config", measurementId, { send_page_view: false });
+          }
+
+          // Configure Floodlight (CM360)
+          if (floodlightId) {
+            window.gtag("config", floodlightId, { send_page_view: false, allow_enhanced_conversions: true });
+          }
+
+          // Configure Google Ads MCC (manager) account — dual-fired
+          // alongside measurementId during the account migration.
+          if (mccMeasurementId) {
+            window.gtag("config", mccMeasurementId, { send_page_view: false });
+          }
+
+          logDebug("gtag.js loaded", { measurementId, floodlightId, mccMeasurementId });
+        }
+
+        // Create isolated segment object on window
+        window.isolatedSegment = {
+          initialized: false,
+          writeKey: null,
+          segmentCdnHost: null,
+
+          // Initialize the isolated segment instance
+          init: function (
+            writeKey,
+            segmentCdnHost,
+            gtagMeasurementId,
+            floodlightId,
+            gtagMccMeasurementId,
+          ) {
+            logDebug("init called", {
+              writeKey: writeKey?.substring(0, 10) + "...",
+              segmentCdnHost,
+              gtagMeasurementId,
+              gtagMccMeasurementId,
+              floodlightId,
+              alreadyInitialized: this.initialized,
+            });
+
+            if (this.initialized) {
+              logDebug("Already initialized, skipping");
+              return;
+            }
+
+            this.writeKey = writeKey;
+            this.segmentCdnHost = segmentCdnHost;
+
+            try {
+              logDebug("Loading analytics via analytics.js");
+
+              // Set custom CDN host if provided
+              if (segmentCdnHost) {
+                // Override the analytics.load function to use custom CDN
+                const originalLoad = window.analytics.load;
+                window.analytics.load = function (key, options) {
+                  const script = document.createElement("script");
+                  script.type = "text/javascript";
+                  script.async = true;
+                  script.setAttribute(
+                    "data-global-segment-analytics-key",
+                    "analytics",
+                  );
+                  script.src =
+                    "https://" +
+                    segmentCdnHost +
+                    "/analytics.js/v1/" +
+                    key +
+                    "/analytics.min.js";
+                  const firstScript =
+                    document.getElementsByTagName("script")[0];
+                  firstScript.parentNode.insertBefore(script, firstScript);
+                  window.analytics._loadOptions = options;
+                };
+              }
+
+              // Configure analytics options
+              const loadOptions = {
+                disableClientPersistence: true, // Prevent Segment from setting ajs_anonymous_id cookie
+                integrations: {
+                  All: false,
+                  "Segment.io": false,
+                  "Facebook Pixel": true,
+                },
+              };
+
+              // Load analytics
+              window.analytics.load(writeKey, loadOptions);
+
+              // Initialize gtag.js if measurement ID or Floodlight ID provided
+              if (gtagMeasurementId || floodlightId || gtagMccMeasurementId) {
+                initGtag(gtagMeasurementId, floodlightId, gtagMccMeasurementId);
+              }
+
+              this.initialized = true;
+
+              // pixel telemetry: record configured pixel IDs for each
+              // vendor, then start watching resource timings. FB emits
+              // the constant "fb" rather than the numeric pixel id —
+              // the real id lives in Segment's destination config (not
+              // ours), so the parent cannot ground-truth it.
+              // Both Google Ads accounts (legacy + MCC) fire to the
+              // same googleadservices.com/doubleclick endpoints, so
+              // the resource-timing observer cannot tell their
+              // beacons apart. They share one telemetry bucket; the
+              // representative ID is whichever is configured (legacy
+              // first, falling back to MCC) so this survives either
+              // account's removal.
+              if (gtagMeasurementId || gtagMccMeasurementId) {
+                pixelFirePixelIds.google_ads =
+                  gtagMeasurementId || gtagMccMeasurementId;
+              }
+              if (floodlightId) {
+                pixelFirePixelIds.floodlight = floodlightId;
+              }
+              pixelFirePixelIds.facebook = "fb";
+              startPixelFireObserver();
+
+              logDebug("Analytics loaded successfully", {
+                hasAnalytics: !!window.analytics,
+                hasGtag: typeof window.gtag === "function",
+              });
+
+              // Clear the ready interval
+              if (readyInterval) {
+                clearInterval(readyInterval);
+                readyInterval = null;
+              }
+
+              // Send confirmation back to parent
+              this.sendMessage({
+                type: "segment_initialized",
+                success: true,
+              });
+            } catch (error) {
+              logDebug("Failed to initialize analytics", {
+                error: error.message,
+              });
+              this.sendMessage({
+                type: "segment_initialized",
+                success: false,
+                error: error.message,
+              });
+            }
+          },
+
+          track: async function (event, properties, options) {
+            logDebug("track called", {
+              event,
+              properties,
+              initialized: this.initialized,
+              hasAnalytics: !!window.analytics,
+              hasGtag: typeof window.gtag === "function",
+            });
+
+            if (!this.initialized) {
+              logDebug("Track skipped - not initialized");
+              return;
+            }
+
+            // Fire gtag conversions first — gtag() is synchronous (just
+            // pushes to dataLayer) and has no dependency on Segment. Doing it
+            // before the FB await means a hung Segment promise can't block it.
+            if (typeof window.gtag === "function") {
+              var floodlightSendTo = resolveFloodlightSendTo(
+                event,
+                properties,
+              );
+              if (floodlightSendTo) {
+                try { pixelAttempt(pixelFirePixelIds.floodlight); } catch {}
+                window.gtag("event", "conversion", {
+                  send_to: floodlightSendTo,
+                });
+                logDebug("Track completed for Floodlight", {
+                  event,
+                  send_to: floodlightSendTo,
+                });
+              }
+
+              var googleAdsConversion = resolveGoogleAdsConversion(
+                event,
+                properties,
+              );
+              if (googleAdsConversion) {
+                try { pixelAttempt(pixelFirePixelIds.google_ads); } catch {}
+                window.gtag("event", "conversion", googleAdsConversion);
+                logDebug("Track completed for Google Ads", {
+                  event,
+                  send_to: googleAdsConversion.send_to,
+                });
+              }
+
+              var googleAdsMccConversion = resolveGoogleAdsMccConversion(
+                event,
+                properties,
+              );
+              if (googleAdsMccConversion) {
+                try { pixelAttempt(pixelFirePixelIds.google_ads); } catch {}
+                window.gtag("event", "conversion", googleAdsMccConversion);
+                logDebug("Track completed for Google Ads (MCC)", {
+                  event,
+                  send_to: googleAdsMccConversion.send_to,
+                });
+              }
+            }
+
+            // Get the remapped Facebook event name
+            const fbEventName = FB_EVENT_MAPPING[event] || event;
+
+            if (window.analytics) {
+              try { pixelAttempt(pixelFirePixelIds.facebook); } catch {}
+              try {
+                // Track with Facebook event name for Facebook Pixel only
+                await window.analytics.track(fbEventName, properties || {}, {
+                  ...(options || {}),
+                  integrations: {
+                    All: false,
+                    "Facebook Pixel": true,
+                  },
+                });
+                logDebug("Track completed for Facebook Pixel", {
+                  originalEvent: event,
+                  fbEventName,
+                });
+              } catch (e) {
+                logDebug("Track failed for Facebook Pixel", {
+                  originalEvent: event,
+                  error: String(e),
+                });
+              }
+            }
+          },
+
+          identify: async function (userId, traits, options) {
+            logDebug("identify called", {
+              userId,
+              traits,
+              initialized: this.initialized,
+              hasAnalytics: !!window.analytics,
+            });
+
+            if (!this.initialized) {
+              logDebug("Identify skipped - not initialized");
+              return;
+            }
+
+            // Set user_data for Enhanced Conversions (CM360/SA360).
+            // gtag normalizes and SHA-256 hashes the email client-side
+            // before sending — raw email never leaves the browser unhashed.
+            if (typeof window.gtag === "function" && traits && traits.email) {
+              window.gtag("set", "user_data", { email: traits.email });
+              logDebug("gtag user_data set for Enhanced Conversions");
+            }
+
+            if (!window.analytics) {
+              logDebug("Identify skipped for Segment - no analytics");
+              return;
+            }
+
+            try {
+              await window.analytics.identify(
+                userId,
+                traits || {},
+                options || {},
+              );
+              logDebug("Identify completed", { userId });
+            } catch (e) {
+              logDebug("Identify failed for Segment", {
+                userId,
+                error: String(e),
+              });
+            }
+          },
+
+          // Send messages to parent window
+          sendMessage: function (data) {
+            // Only log sendMessage for non-ready messages after initialization
+            if (data.type !== "iframe_ready") {
+              logDebug("sendMessage called", { data });
+            }
+            if (window.parent && window.parent !== window) {
+              try {
+                window.parent.postMessage(
+                  {
+                    source: "isolated-segment",
+                    ...data,
+                  },
+                  "*",
+                );
+                if (data.type !== "iframe_ready") {
+                  logDebug("Message sent to parent", { type: data.type });
+                }
+              } catch (error) {
+                logDebug("Failed to send message to parent", { error });
+              }
+            }
+          },
+        };
+
+        // Listen for messages from parent
+        function handleMessage(event) {
+          // Security check: validate the origin is from the same base domain
+          // Allow both same-origin (for localhost) and parent domain (for a.subdomain setup)
+          const currentOrigin = window.location.origin;
+          const currentHostname = window.location.hostname;
+          const eventHostname = new URL(event.origin).hostname;
+
+          // Extract base domain (remove 'a.' prefix if present)
+          const baseDomain = currentHostname.startsWith("a.")
+            ? currentHostname.substring(2)
+            : currentHostname;
+          const eventBaseDomain = eventHostname.startsWith("a.")
+            ? eventHostname.substring(2)
+            : eventHostname;
+
+          // Allow messages from same origin or from parent domain
+          const isValidOrigin =
+            event.origin === currentOrigin || eventBaseDomain === baseDomain;
+
+          if (!isValidOrigin) {
+            logDebug("Message rejected - invalid origin", {
+              expected: currentOrigin,
+              expectedBaseDomain: baseDomain,
+              received: event.origin,
+              receivedBaseDomain: eventBaseDomain,
+            });
+            return;
+          }
+
+          logDebug("Message received from parent", {
+            origin: event.origin,
+            data: event.data,
+          });
+
+          const data = event.data;
+
+          if (data.target !== "isolated-segment") {
+            logDebug("Message not for isolated-segment, ignoring", {
+              target: data.target,
+            });
+            return;
+          }
+
+          logDebug("Processing message", { type: data.type });
+
+          switch (data.type) {
+            case "init":
+              // Don't log before init is called
+              window.isolatedSegment.init(
+                data.writeKey,
+                data.cdnHost,
+                data.gtagMeasurementId,
+                data.floodlightId,
+                data.gtagMccMeasurementId,
+              );
+              break;
+
+            case "track":
+              logDebug("Handling track message", { event: data.event });
+              window.isolatedSegment.track(
+                data.event,
+                data.properties,
+                data.options,
+              );
+              break;
+
+            case "identify":
+              logDebug("Handling identify message", { userId: data.userId });
+              window.isolatedSegment.identify(data.userId, data.traits);
+              break;
+
+            default:
+              logDebug("Unknown message type", { type: data.type });
+              break;
+          }
+        }
+
+        window.addEventListener("message", handleMessage);
+
+        function sendReadyMessage() {
+          logDebug("Sending iframe_ready message");
+          if (!window.isolatedSegment.initialized) {
+            window.isolatedSegment.sendMessage({
+              type: "iframe_ready",
+              timestamp: new Date().toISOString(),
+            });
+          } else if (readyInterval) {
+            clearInterval(readyInterval);
+            readyInterval = null;
+          }
+        }
+
+        // Notify parent that iframe is ready after DOM is loaded
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", function () {
+            sendReadyMessage();
+            // Keep sending every 500ms until initialized
+            readyInterval = setInterval(sendReadyMessage, 500);
+          });
+        } else {
+          // DOM is already loaded
+          sendReadyMessage();
+          // Keep sending every 500ms until initialized
+          readyInterval = setInterval(sendReadyMessage, 500);
+        }
+      })();
+    </script>
+  <style></style></head>
+  <body>
+    <h1 hidden="">Isolated Segment</h1>
+  <script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a1dbe2886d657f98',t:'MTc4NDQ4Njc0NA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><iframe height="1" width="1" style="position: absolute; top: 0px; left: 0px; border-width: medium; border-style: none; border-color: currentcolor; border-image: none; visibility: hidden;" src="./saved_resource(1).html"></iframe>
+
+</body></html>
